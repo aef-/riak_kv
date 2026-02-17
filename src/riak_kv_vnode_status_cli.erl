@@ -25,6 +25,7 @@
 -include_lib("kernel/include/logger.hrl").
 
 -export([register_cli/0]).
+-export([vnode_status_on_nodes/2, tableify/1, tableify1/1]).
 
 register_cli() ->
     register_all_usage(),
@@ -34,93 +35,93 @@ register_all_usage() ->
     clique:register_usage(["riak-admin", "vnode-status"], main_usage()).
 
 register_all_commands() ->
-    clique:register_command(get_vnode_status_specs()).
+    lists:foreach(
+      fun(Args) -> apply(clique, register_command, Args) end,
+      [get_vnode_status_specs()]).
 
 main_usage() ->
-    ["riak-admin vnode-status [-n|--node NODE|all] [-p|--partition PARTITION|all] \n",
+    ["riak-admin vnode-status [-n|--node NODE|all] [-p|--partition PARTITION|all]\n",
+     "                        [-f|--format json|csv|table]\n",
      "Print vnode status, including backend stats and info,\n",
-     "on specified NODE and PARTITION (defaults to current node and all partitions).\n"
+     "on specified NODE and PARTITION (defaults to current node\n",
+     "and all partitions, table format).\n"
     ].
 
 
--define(NODEOPT, {node, [{shortname, "n"},
-                         {longname, "node"},
-                         {typecast, fun to_node/1}]}).
--define(PARTITIONOPT, {partition, [{shortname, "p"},
-                                   {longname, "partition"},
-                                   {typecast, fun to_partition/1}]}).
+-define(NODEOPT,
+        {node, [{shortname, "n"},
+                {longname, "node"},
+                {typecast, fun to_node/1}]}).
+-define(FORMATOPT,
+        {format, [{shortname, "f"},
+                  {longname, "format"}]}).
 
 get_vnode_status_specs() ->
     [["riak-admin", "vnode-status"],
-     '_', [?NODEOPT, ?PARTITIONOPT],
-     fun(A, B, C) -> get_vnode_status_cmd/3, A, B, C) end
+     '_', [?NODEOPT, ?FORMATOPT],
+     fun get_vnode_status_cmd/3
     ].
 
 
-get_vnode_status_cmd([_, _, _ | Args], _, Options) ->
+get_vnode_status_cmd([_, _ | Args], _, Options) ->
     Nodes = extract_nodes(Options),
-    Vnodes = extract_vnodes(Options, Nodes),
+    Format = proplists:get_value(format, Options, "table"),
     case Args of
-        [] ->
+        [] when Format == "table" ->
             [clique_status:table(
-               [[{node, N}, {index, P}, {rebuild_schedule, FmtF(Res)}]
-                || {Res, {P, N}} <- get_rebuild_schedule(Vnodes)])];
+               [[{node, N}] ++ lists:flatten([tableify(X) || {_Idx, X} <- Res])
+                || {Res, N} <- vnode_status_on_nodes(Nodes, [])])
+            ];
         _ ->
             clique_status:usage()
     end.
 
+tableify(PP) ->
+    [tableify1(P) || P <- PP].
 
--spec(vnode_status([]) -> ok).
-vnode_status([]) ->
-    try
-        case riak_kv_status:vnode_status() of
-            [] ->
-                io:format("There are no active vnodes.~n");
-            Statuses ->
-                io:format("~s~n-------------------------------------------~n~n",
-                          ["Vnode status information"]),
-                print_vnode_statuses(lists:sort(Statuses))
-        end
-    catch
-        Exception:Reason ->
-            ?LOG_ERROR("Backend status failed ~p:~p", [Exception,
-                    Reason]),
-            io:format("Backend status failed, see log for details~n"),
-            error
-    end.
+tableify1({backend_status, Backend, BS}) ->
+    tableify_backend(Backend, BS);
+tableify1({vnodeid, Id}) ->
+    {vnodeid, printable_bin(Id)};
+tableify1(P) -> P.
+
+tableify_backend(riak_kv_leveled_backend, PP) ->
+    [tableify_led_prop(P) || P <- maps:to_list(PP)];
+tableify_backend(_, PP) when is_map(PP) ->
+    maps:to_list(PP);
+tableify_backend(_, PP) ->
+    PP.
+
+tableify_led_prop({A, undefined}) ->
+    {A, undefined};
+tableify_led_prop({fetch_count_by_level,
+                   #{not_found := A1, lower := A2, mem := A3,
+                     '0' := A4, '1' := A5, '2' := A6, '3' := A7}}) ->
+    F = fun(#{count := C, time := T}) -> io_lib:format("~b,~b", [C, T]) end,
+    {fetch_count_by_level,
+     iolist_to_binary(
+       io_lib:format("nf:~s lwr:~s mem:~s 0:~s 1:~s 2:~s 3:~s",
+                     [F(A1), F(A2), F(A3), F(A4), F(A5), F(A6), F(A7)]))};
+tableify_led_prop({penciller_work_backlog_status, {A, B1, B2}}) ->
+    F = fun(true) -> "+"; (false) -> "-" end,
+    {penciller_work_backlog_status, iolist_to_binary(io_lib:format("~b ~s ~s", [A, F(B1), F(B2)]))};
+tableify_led_prop({level_files_count, Map}) ->
+    F = fun(#{level := L, count := C}) -> io_lib:format("~b:~b", [L, C]) end,
+    {level_files_count, iolist_to_binary(lists:join(" ", [F(A) || A <- maps:to_list(Map)]))};
+tableify_led_prop({A, TS}) when A =:= penciller_last_merge_time;
+                                A =:= journal_last_compaction_time ->
+    {A, calendar:system_time_to_rfc3339(TS, [{unit, millisecond}])};
+tableify_led_prop(Unchanged) ->
+    Unchanged.
 
 
-print_vnode_statuses([]) ->
-    ok;
-print_vnode_statuses([{VNodeIndex, StatusData} | RestStatuses]) ->
-    io:format("VNode: ~p~n", [VNodeIndex]),
-    print_vnode_status(StatusData),
-    io:format("~n"),
-    print_vnode_statuses(RestStatuses).
 
-print_vnode_status([]) ->
-    ok;
-print_vnode_status([{backend_status,
-                     Backend,
-                     StatusItem} | RestStatusItems]) ->
-    if is_binary(StatusItem) ->
-            StatusString = binary_to_list(StatusItem),
-            io:format("Backend: ~p~nStatus: ~n~s~n",
-                      [Backend, string:strip(StatusString)]);
-       true ->
-            io:format("Backend: ~p~nStatus: ~n~p~n",
-                      [Backend, StatusItem])
-    end,
-    print_vnode_status(RestStatusItems);
-print_vnode_status([StatusItem | RestStatusItems]) ->
-    if is_binary(StatusItem) ->
-            StatusString = binary_to_list(StatusItem),
-            io:format("Status: ~n~s~n",
-                      [string:strip(StatusString)]);
-       true ->
-            io:format("Status: ~n~p~n", [StatusItem])
-    end,
-    print_vnode_status(RestStatusItems).
+vnode_status_on_nodes([], Q) ->
+    Q;
+vnode_status_on_nodes([N|Rest], Q) ->
+    Preflists = rpc:call(N, riak_core_vnode_manager, all_index_pid, [riak_kv_vnode]),
+    Res = rpc:call(N, riak_kv_vnode, vnode_status, [Preflists]),
+    vnode_status_on_nodes(Rest, [{Res, N} | Q]).
 
 
 extract_nodes(Options) ->
@@ -133,40 +134,11 @@ extract_nodes(Options) ->
         _ ->
             [node()]
     end.
-extract_vnodes(Options, Nodes) ->
-    PP = [P || {partition, P} <- Options],
-    HaveAll = lists:member(all, PP) or (length(PP) == 0),
-    HaveManyNodes = length(Nodes) > 1,
-    case {HaveManyNodes, HaveAll} of
-        {true, false} ->
-            io:format("With more than a single node, only -p all is allowed\n", []),
-            throw(inconsistent_options);
-        {_, true} ->
-            lists:flatten([[{P, N} || {P, _} <- vnodes(N, all)] || N <- Nodes]);
-        {_, false} ->
-            lists:flatten([[{P, N} || {P, _} <- vnodes(N, PP)] || N <- Nodes])
-    end.
-
-vnodes(Node, all) ->
-    {ok, Ring} = rpc:call(Node, riak_core_ring_manager, get_my_ring, []),
-    [VN || VN = {_, Owner} <- rpc:call(Node, riak_core_ring, all_owners, [Ring]), Owner =:= Node];
-vnodes(Node, List) ->
-    [{P, Node} || P <- List].
-
 
 to_node("all") ->
     all;
 to_node(A) ->
     clique_typecast:to_node(A).
-
-to_partition("all") ->
-    all;
-to_partition(A) ->
-    try
-        list_to_integer(A)
-    catch _:_ ->
-            {error, bad_partition}
-    end.
 
 
 printable_bin(K) ->
@@ -176,32 +148,6 @@ printable_bin(K) ->
         _ ->
             iolist_to_binary(["0x", mochihex:to_hex(K)])
     end.
-bin_from_maybe_hex("0x" ++ A) -> mochihex:to_bin(A);
-bin_from_maybe_hex(A) -> list_to_binary(A).
-
-printable_vclock(A) ->
-    base64:encode(riak_object:encode_vclock(A)).
-
-tree_size("xxsmall") -> xxsmall;
-tree_size("xsmall") -> xsmall;
-tree_size("small") -> small;
-tree_size("medium") -> medium;
-tree_size("large") -> large;
-tree_size("xlarge") -> xlarge.
-
-time2s(never) ->
-    never;
-time2s(now) ->
-    time2s(calendar:local_time());
-time2s({_, _, _} = A) ->
-    time2s(calendar:now_to_local_time(A));
-time2s({{LRY, LRMo, LRD}, {LRH, LRMi, LRS}}) ->
-    iolist_to_binary(
-      io_lib:format("~4.10.0B-~2.10.0B-~2.10.0BT~2.10.0B:~2.10.0B:~2.10.0B",
-                    [LRY, LRMo, LRD, LRH, LRMi, LRS])).
-
-ending([_]) -> "";
-ending(_) -> "s".
 
 clique_status_text(F, A) ->
     clique_status:text(io_lib:format(F, A)).
